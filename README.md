@@ -5,13 +5,13 @@
 A [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) **mixin** that adds
 [Sonar Vortex](https://www.sonarsource.com/products/sonar-vortex/) to a Claude
 Code sandbox. It installs the [SonarQube CLI](https://docs.sonarsource.com/sonarqube-cli/)
-(`sonar`) and wires the [SonarQube MCP Server](https://github.com/SonarSource/sonarqube-mcp-server)
-so the agent gets **repository-aware context before it writes code** (coding
-guidelines, dependency health, architecture constraints, semantic navigation)
-and **verifies every change in real time** against your SonarQube Cloud quality
-profiles and rules — using the same algorithmic analysis engine trusted in
-production. Your SonarQube token is proxy-injected and **never enters the
-container**.
+(`sonar`) and runs `sonar integrate claude` to wire the SonarQube MCP Server,
+secrets-scanning hooks, and Vortex context, so the agent gets **repository-aware
+context before it writes code** (coding guidelines, dependency health,
+architecture constraints, semantic navigation) and **verifies every change in
+real time** against your SonarQube Cloud quality profiles and rules — using the
+same algorithmic analysis engine trusted in production. Your SonarQube token is
+proxy-injected and **never enters the container**.
 
 This pairs the sandbox's isolation + egress control with Sonar's real-time AI
 code verification: the agent produces higher-quality, more secure code with
@@ -19,22 +19,21 @@ fewer tokens and less rework.
 
 ## What it does
 
-- Installs the **SonarQube CLI** (`sonar`) natively from the official installer,
-  and puts it on the agent's `PATH`.
-- Wires the **SonarQube MCP Server** via a workspace `.mcp.json` that launches
-  `sonar run mcp` (through `~/.sonar/mcp.sh`), exposing the Vortex context tools
-  to the agent.
-- Declares one proxy-injected credential — `sonarqube` → `SONARQUBE_TOKEN`.
-  Inside the container the token reads as the `proxy-managed` sentinel (never the
-  real value); the sbx proxy swaps in the real token on the
-  `Authorization: Bearer` header for outbound calls to SonarQube Cloud. Because
-  both the CLI and the MCP server run **natively** (no nested container), they
-  trust the proxy CA and their egress is intercepted for the swap.
-- Sets `SONARQUBE_URL` (region), `SONARQUBE_ORG` (organization), and optionally
-  `SONAR_PROJECT_KEY` (project scope). `SONAR_TOKEN` / `SONARQUBE_CLI_TOKEN` are
-  aliases of the same proxy sentinel.
+- Installs the **SonarQube CLI** (`sonar`) natively from the official installer
+  and links it into `~/.local/bin` so it's on `PATH` for every shell.
+- On start, runs **`sonar integrate claude --global --non-interactive`** to wire
+  the **SonarQube MCP Server**, secrets-scanning hooks, and Vortex context into
+  Claude Code (best-effort; the agent can re-run it once a valid token is bound).
+- Declares one proxy-injected credential — `sonarqube` → **`SONARQUBE_CLI_TOKEN`**
+  (the SonarQube CLI's headless-auth token var). Inside the container the token
+  reads as a proxy placeholder (never the real value); the sbx proxy swaps in the
+  real token on the `Authorization: Bearer` header for outbound calls to SonarQube
+  Cloud. Because the CLI runs **natively** (no nested container), it trusts the
+  proxy CA and its egress is intercepted for the swap.
+- Sets `SONARQUBE_CLI_SERVER` (region) and `SONARQUBE_CLI_ORG` (organization) —
+  the CLI's env-var auth needs all three — plus `SONAR_PROJECT_KEY` (optional).
 - Allows egress to SonarQube Cloud (`sonarcloud.io` / `sonarqube.us` + `api.*`)
-  and the CLI/analyzer download hosts.
+  and the CLI/analyzer download hosts; disables CLI telemetry.
 - Ships agent instructions on running the Vortex loop and a runbook
   (`~/runbooks/sonar-vortex.md`).
 
@@ -55,26 +54,29 @@ placeholder; the proxy swaps in the real token on the outbound request.
 
 ```bash
 # EU region (sonarcloud.io) — the default
-sbx secret set-custom --host api.sonarcloud.io --env SONARQUBE_TOKEN --value <user-token>
-sbx secret set-custom --host sonarcloud.io     --env SONARQUBE_TOKEN --value <user-token>
+sbx secret set-custom --host api.sonarcloud.io --env SONARQUBE_CLI_TOKEN --value <user-token>
 
 # US region (sonarqube.us) — if you launch with url=https://sonarqube.us
-# sbx secret set-custom --host api.sonarqube.us --env SONARQUBE_TOKEN --value <user-token>
-# sbx secret set-custom --host sonarqube.us     --env SONARQUBE_TOKEN --value <user-token>
+# sbx secret set-custom --host api.sonarqube.us --env SONARQUBE_CLI_TOKEN --value <user-token>
 ```
+
+`SONARQUBE_CLI_TOKEN` is the env var the SonarQube CLI reads for headless auth
+(paired with `SONARQUBE_CLI_SERVER` / `SONARQUBE_CLI_ORG`, which the kit sets from
+the `url` / `org` args). A custom env can only be bound once, so bind it on the
+`api.` host — that's the endpoint the CLI calls.
 
 Add `--sandbox <name>` to scope a secret to one sandbox; pass `--ref 'op://…'`
 instead of `--value` to source from 1Password without putting the token in your
 shell history. Confirm with `sbx secret ls`.
 
 > The real token is stored encrypted host-side and swapped in by the proxy at
-> request time. Don't put it in `environment.variables`, in `.mcp.json`, or in
-> any file in the repo.
+> request time. Don't put it in `environment.variables` or in any file in the
+> repo.
 
 ## Usage
 
-This mixin targets the **`claude`** base agent (it ships Claude Code's
-`.mcp.json`). Only the `--kit` value changes between the forms below.
+This mixin targets the **`claude`** base agent (it runs `sonar integrate claude`
+to wire the MCP server). Only the `--kit` value changes between the forms below.
 
 **Published OCI artifact** (available once merged to `main`):
 
@@ -136,10 +138,11 @@ quality gate or a new blocker/critical issue as unfinished work.
 ## Verify
 
 ```bash
-sbx exec <sandbox> -- sh -lc 'sonar --version'
-sbx exec <sandbox> -- printenv SONARQUBE_TOKEN          # -> proxy-managed (never a real token)
-sbx exec <sandbox> -- printenv SONARQUBE_URL SONARQUBE_ORG
-sbx exec <sandbox> -- sh -lc 'sonar list projects | head'
+sbx exec <sandbox> -- sonar --version
+sbx exec <sandbox> -- printenv SONARQUBE_CLI_TOKEN     # -> a proxy placeholder (never a real token)
+sbx exec <sandbox> -- printenv SONARQUBE_CLI_SERVER SONARQUBE_CLI_ORG
+sbx exec <sandbox> -- sonar auth status                # -> Connected (Source: env vars)
+sbx exec <sandbox> -- sonar list projects              # lists your projects with a valid token
 sbx policy log <sandbox> | grep -Ei 'sonarcloud|sonarqube'   # calls reached SonarQube Cloud
 ```
 
@@ -149,7 +152,7 @@ The kit declares an egress allowlist for the SonarQube host, but that inline
 allowlist is honored **only when sandbox policy is managed locally**. Under
 org-managed governance (`sbx policy ls` shows `Governance: Managed by <org>`), an
 org admin must allow the SonarQube host, and egress may be forced *transparent*
-(no TLS interception) — in which case the `SONARQUBE_TOKEN` sentinel is not
+(no TLS interception) — in which case the `SONARQUBE_CLI_TOKEN` placeholder is not
 swapped and calls return 401. Credential injection needs an intercepting
 (local-policy) daemon. See the datadog kit's README for the full governance
 walkthrough of the same mechanism.
@@ -158,14 +161,14 @@ walkthrough of the same mechanism.
 
 `scripts/test-kit-e2e.sh` boots a real sandbox with the kit under a throwaway,
 scoped `--app-name` daemon (so your day-to-day sbx state is untouched) and
-asserts the CLI installed, the MCP launcher resolves it, the `SONARQUBE_*` env is
-wired, and the token arrives as a proxy placeholder (never the real value). The
-script never takes the token as an arg/env — store it once as a custom secret,
-then run it:
+asserts the CLI installed and on `PATH`, the `SONARQUBE_CLI_*` env is wired, the
+token arrives as a proxy placeholder (never the real value), and `sonar auth
+status` connects. The script never takes the token as an arg/env — store it once
+as a custom secret, then run it:
 
 ```bash
-sbx --app-name sbx-kit-sonar-vortex-tck secret set-custom \
-  --host api.sonarcloud.io --env SONARQUBE_TOKEN --value <user-token>
+sbx --app-name sonar-vortex-tck secret set-custom \
+  --host api.sonarcloud.io --env SONARQUBE_CLI_TOKEN --value <user-token>
 ./scripts/test-kit-e2e.sh
 ```
 
@@ -185,10 +188,12 @@ python3 scripts/gen-architecture.py
 
 - `environment.variables` uses last-wins composition: a later `--kit` can
   override any `SONARQUBE_*` value set here.
-- The MCP server runs via the native SonarQube CLI (`sonar run mcp`), so no Java
-  or nested Docker is required inside the sandbox. The standalone
-  [MCP server JAR/Docker image](https://github.com/SonarSource/sonarqube-mcp-server)
-  are alternatives if you prefer them.
+- The MCP server + Vortex context are wired by `sonar integrate claude`, which
+  runs the SonarQube MCP Server locally — no Java or nested Docker required. The
+  standalone [MCP server JAR/Docker image](https://github.com/SonarSource/sonarqube-mcp-server)
+  are alternatives if you prefer to configure it yourself.
+- `sonar integrate claude` validates the token against SonarQube Cloud, so it only
+  completes with a **valid** bound token; otherwise re-run it from a shell.
 - Docs: <https://www.sonarsource.com/products/sonar-vortex/> ·
   <https://docs.sonarsource.com/sonarqube-cli/>
 

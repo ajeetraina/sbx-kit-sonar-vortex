@@ -10,8 +10,8 @@
 # The token is NEVER passed as a plain-text arg/env by this script. It lives in
 # the sbx secret store as a CUSTOM secret bound to the SonarQube Cloud host:
 #
-#   sbx --app-name sbx-kit-sonar-vortex-tck secret set-custom \
-#       --host api.sonarcloud.io --env SONARQUBE_TOKEN --value <user-token>
+#   sbx --app-name sonar-vortex-tck secret set-custom \
+#       --host api.sonarcloud.io --env SONARQUBE_CLI_TOKEN --value <user-token>
 #
 # (Use --ref 'op://…' instead of --value to source from 1Password.) Everything is
 # scoped to a separate --app-name daemon, so your day-to-day sbx state is left
@@ -23,7 +23,7 @@
 # Environment (never the token):
 #   URL        SonarQube Cloud URL     (default: https://sonarcloud.io)
 #   ORG        SonarQube org key       (default: empty)
-#   APP_NAME   scoped sbx daemon name  (default: sbx-kit-sonar-vortex-tck)
+#   APP_NAME   scoped sbx daemon name  (default: sonar-vortex-tck)
 #   POLICY     default network policy  (default: balanced; empty to skip)
 #   KEEP       keep the sandbox: 1 or 0 (default 0)
 
@@ -32,7 +32,7 @@ set -euo pipefail
 # ---- config ----------------------------------------------------------------
 URL="${URL:-https://sonarcloud.io}"
 ORG="${ORG:-}"
-APP_NAME="${APP_NAME:-sbx-kit-sonar-vortex-tck}"
+APP_NAME="${APP_NAME:-sonar-vortex-tck}"
 POLICY="${POLICY-balanced}"
 KEEP="${KEEP:-0}"
 
@@ -75,20 +75,19 @@ fi
 
 # ---- 2. secret: custom secret bound to the SonarQube host ------------------
 say "2. SonarQube token as a custom secret on $API_HOST / $SQ_HOST"
-if [ -n "${SONARQUBE_TOKEN:-}" ]; then
-  info "note: SONARQUBE_TOKEN found in env; this script ignores it and uses the secret store."
+if [ -n "${SONARQUBE_CLI_TOKEN:-}" ]; then
+  info "note: SONARQUBE_CLI_TOKEN found in env; this script ignores it and uses the secret store."
 fi
 for _ in 1 2 3 4 5; do "${SBX[@]}" secret ls >/dev/null 2>&1 && break; sleep 1; done
 secrets_out="$("${SBX[@]}" secret ls 2>/dev/null || true)"
-if grep -q "SONARQUBE_TOKEN" <<<"$secrets_out"; then
-  ok "SONARQUBE_TOKEN custom secret present"
+if grep -q "SONARQUBE_CLI_TOKEN" <<<"$secrets_out"; then
+  ok "SONARQUBE_CLI_TOKEN custom secret present"
 else
-  bad "SONARQUBE_TOKEN custom secret missing"
+  bad "SONARQUBE_CLI_TOKEN custom secret missing"
   cat <<EOF
 
   Store the token first (value never touches this script), then re-run:
-    ${SBX[*]} secret set-custom --host $API_HOST --env SONARQUBE_TOKEN --value <user-token>
-    ${SBX[*]} secret set-custom --host $SQ_HOST  --env SONARQUBE_TOKEN --value <user-token>
+    ${SBX[*]} secret set-custom --host $API_HOST --env SONARQUBE_CLI_TOKEN --value <user-token>
   (or --ref 'op://<vault>/<item>/<field>' to source from 1Password)
 EOF
   exit 1
@@ -123,27 +122,31 @@ ex() { "${SBX[@]}" exec "$SANDBOX" -- "$@"; }
 
 # ---- 5. in-container verification ------------------------------------------
 say "5. Verify inside the container"
-if v=$(ex sh -lc 'sonar --version' 2>/dev/null); then ok "sonar CLI installed ($(printf '%s' "$v" | head -1))"; else bad "sonar CLI not resolvable"; fi
-if ex test -f "$HOME/.sonar/mcp.sh" 2>/dev/null || ex sh -lc 'test -f "$HOME/.sonar/mcp.sh"'; then ok "MCP launcher ~/.sonar/mcp.sh present"; else bad "MCP launcher missing"; fi
-if ex sh -lc 'test -f "$PWD/.mcp.json" || test -f ./.mcp.json' 2>/dev/null; then ok ".mcp.json present in workspace"; else info ".mcp.json not found in CWD (check workspace root)"; fi
-[ "$(ex printenv SONARQUBE_URL 2>/dev/null)" = "$URL" ] && ok "SONARQUBE_URL=$URL" || bad "SONARQUBE_URL mismatch"
-[ -n "$(ex printenv SONARQUBE_ORG 2>/dev/null || true)" ] || info "SONARQUBE_ORG empty (pass ORG=<org> to set it)"
+# sonar must resolve via a plain (non-login) exec — proves the ~/.local/bin symlink.
+if v=$(ex sonar --version 2>/dev/null); then ok "sonar CLI on PATH ($(printf '%s' "$v" | head -1))"; else bad "sonar CLI not resolvable via plain exec (PATH symlink?)"; fi
+[ "$(ex printenv SONARQUBE_CLI_SERVER 2>/dev/null)" = "$URL" ] && ok "SONARQUBE_CLI_SERVER=$URL" || bad "SONARQUBE_CLI_SERVER mismatch"
+[ -n "$(ex printenv SONARQUBE_CLI_ORG 2>/dev/null || true)" ] || info "SONARQUBE_CLI_ORG empty (pass ORG=<org> to set it)"
 # The container should only ever see a proxy placeholder, never a real token.
-for var in SONARQUBE_TOKEN SONAR_TOKEN SONARQUBE_CLI_TOKEN; do
+for var in SONARQUBE_CLI_TOKEN; do
   val="$(ex printenv "$var" 2>/dev/null || true)"
   case "$val" in
-    ""|proxy-managed|sbx-cs-*) info "$var = '${val:-unset}' (proxy placeholder, not a real token)" ;;
+    ""|proxy-managed|sbx-cs-*) ok "$var = '${val:-unset}' (proxy placeholder, not a real token)" ;;
     *) bad "$var looks like a real credential value in the container (leak?)" ;;
   esac
 done
 
-# ---- 6. functional: hit SonarQube Cloud (needs an intercepting daemon) ------
-say "6. Live call to SonarQube Cloud (needs an intercepting daemon + valid token)"
-if out=$(ex sh -lc 'sonar list projects 2>&1' ); then
-  printf '%s\n' "$out" | head -5 | sed 's/^/      /'
+# ---- 6. functional: auth + hit SonarQube Cloud (needs a valid token) --------
+say "6. sonar auth status + live call to SonarQube Cloud"
+if ex sonar auth status 2>&1 | grep -qi 'Connected'; then
+  ok "sonar auth status: Connected (env-var auth)"
 else
-  info "sonar list projects returned non-zero (token/org/region or governance) — see above"
+  info "sonar auth status not Connected (SONARQUBE_CLI_ORG/SERVER must both be set)"
 fi
+out=$(ex sonar list projects 2>&1 || true)
+printf '%s\n' "$out" | head -5 | sed 's/^/      /'
+case "$out" in
+  *401*) info "list projects -> 401: plumbing OK (proxy swapped the token); token is invalid/synthetic" ;;
+esac
 
 # ---- 7. network policy log -------------------------------------------------
 say "7. Network policy log (proof the call reached $SQ_HOST)"

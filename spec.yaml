@@ -3,29 +3,29 @@ kind: mixin
 name: sonar-vortex
 displayName: Sonar Vortex
 description: >-
-  Adds Sonar Vortex to a Claude Code sandbox. Installs the SonarQube CLI and
-  wires the SonarQube MCP Server so the agent gets repository-aware context
-  (coding guidelines, dependency health, architecture, semantic navigation)
-  before it writes code, then verifies every change in real time against your
-  SonarQube Cloud quality profiles and rules with the same algorithmic analysis
-  engine used in production. Your SonarQube user token is proxy-injected and
-  never enters the container.
+  Adds Sonar Vortex to a Claude Code sandbox. Installs the SonarQube CLI and runs
+  `sonar integrate claude` to wire the SonarQube MCP Server, secrets-scanning
+  hooks, and Vortex context so the agent gets repository-aware context (coding
+  guidelines, dependency health, architecture, semantic navigation) before it
+  writes code, then verifies every change in real time against your SonarQube
+  Cloud quality profiles and rules with the same algorithmic analysis engine used
+  in production. Your SonarQube token is proxy-injected and never enters the
+  container.
 licenses:
   - Apache-2.0
 
-# Sonar Vortex's flagship integration is Claude Code, and this kit ships Claude
-# Code's `.mcp.json` MCP-server config, so it targets the `claude` base agent.
-# (The same CLI + MCP server work with Copilot/Codex/Cursor/Gemini too, but each
-# uses a different MCP config file — out of scope for this kit.)
+# Sonar Vortex's flagship integration is Claude Code (`sonar integrate claude`),
+# so this kit targets the `claude` base agent. (The SonarQube CLI can also
+# integrate copilot/codex/cursor/gemini, but each writes a different agent config
+# — out of scope for this kit.)
 requires:
   agent: claude
 
-# Sonar Vortex connects to SonarQube Cloud. The region + organization are the
-# only per-user inputs. Because substitution happens before the spec is decoded,
-# `url` parameterizes the credential inject domain, the network allowlist, and
-# the SONARQUBE_URL env together, so the EU (sonarcloud.io) and US (sonarqube.us)
-# regions both work without editing the spec. The token itself is never an arg —
-# it is a proxy-injected credential (see `credentials` below).
+# Sonar Vortex connects to SonarQube Cloud. Region + organization are the only
+# per-user inputs. Because substitution happens before the spec is decoded, `url`
+# parameterizes SONARQUBE_CLI_SERVER and the network allowlist together, so the
+# EU (sonarcloud.io) and US (sonarqube.us) regions both work without editing the
+# spec. The token is never an arg — it is a proxy-injected credential (below).
 args:
   url:
     default: "https://sonarcloud.io"
@@ -44,20 +44,21 @@ args:
   project:
     default: ""
     description: >-
-      Optional SonarQube project key. When set, the MCP server and the Vortex
-      context tools scope to this project (it must already have been analyzed on
-      a long-lived branch in SonarQube Cloud). Leave empty to select per-call.
+      Optional SonarQube project key. When set, `sonar integrate claude` scopes
+      to this project (it must already have been analyzed on a long-lived branch
+      in SonarQube Cloud). Leave empty to select per-call.
     pattern: '^[A-Za-z0-9._:-]*$'
 
-# One secret: the SonarQube USER token. It is sentinel-swapped by the proxy — the
-# container only ever sees SONARQUBE_TOKEN == "proxy-managed", and the proxy
-# substitutes the real token into the `Authorization: Bearer <token>` header on
-# outbound calls to SonarQube Cloud. Both the SonarQube CLI (`sonar`) and the
-# SonarQube MCP Server run natively in the sandbox, trust the sbx proxy CA, and
-# honor HTTPS_PROXY, so the swap happens transparently.
+# The SonarQube USER token. The SonarQube CLI reads it from SONARQUBE_CLI_TOKEN
+# for headless (env-var) auth, alongside SONARQUBE_CLI_SERVER + SONARQUBE_CLI_ORG.
+# It is sentinel-swapped by the proxy: the container only ever sees
+# SONARQUBE_CLI_TOKEN == a proxy placeholder, and the proxy substitutes the real
+# token into the `Authorization: Bearer <token>` header on outbound calls to
+# SonarQube Cloud. The CLI runs natively in the sandbox, trusts the sbx proxy CA,
+# and honors HTTPS_PROXY, so the swap happens transparently.
 #
-# The token injects on BOTH the EU and US API hosts; whichever region the tools
-# actually call gets the swap, the other rule is simply unused. Injection is
+# The token injects on BOTH the EU and US API hosts; whichever region the CLI
+# actually calls gets the swap, the other rule is simply unused. Injection is
 # keyed by (domain, header), so nothing is crossed.
 #
 # NOTE: connected mode requires a USER token — project, global, or scoped
@@ -67,10 +68,8 @@ credentials:
     description: "SonarQube Cloud USER token (sent as Authorization: Bearer)."
     required: true
     apiKey:
-      name: SONARQUBE_TOKEN
+      name: SONARQUBE_CLI_TOKEN
       inject:
-        # The region the user selected (via the `url` arg). Its bare host + the
-        # api. subdomain both see traffic depending on the tool.
         - domain: "sonarcloud.io"
           scheme: bearer
         - domain: "api.sonarcloud.io"
@@ -92,7 +91,7 @@ permissions:
       - "sonarqube.us"
       - "api.sonarqube.us"
       - "*.sonarqube.us"
-      # SonarQube CLI installer + the analyzer/engine artifacts it downloads.
+      # SonarQube CLI installer + the CLI binary / analyzer artifacts it downloads.
       - "raw.githubusercontent.com"
       - "github.com"
       - "objects.githubusercontent.com"
@@ -100,30 +99,23 @@ permissions:
 
 environment:
   variables:
-    # Region + org for the SonarQube CLI and MCP Server. SONARQUBE_URL selects
-    # the region (EU sonarcloud.io by default; set url=https://sonarqube.us for US).
+    # Headless auth config for the SonarQube CLI (SONARQUBE_CLI_TOKEN is the
+    # proxy-injected credential above). SERVER selects the region.
+    SONARQUBE_CLI_SERVER: "${{ kit.args.url }}"
+    SONARQUBE_CLI_ORG: "${{ kit.args.org }}"
+    # The SonarQube MCP Server (configured by `sonar integrate claude`) reads
+    # these; harmless when unused.
     SONARQUBE_URL: "${{ kit.args.url }}"
     SONARQUBE_ORG: "${{ kit.args.org }}"
-    SONAR_HOST_URL: "${{ kit.args.url }}"
-    SONAR_ORGANIZATION: "${{ kit.args.org }}"
-    # Optional project scope, read by the MCP launcher (~/.sonar/mcp.sh) and
-    # available to the CLI. Empty when the `project` arg is unset.
+    # Optional project scope, read by `sonar integrate` and the Vortex context.
     SONAR_PROJECT_KEY: "${{ kit.args.project }}"
-    # The SonarQube CLI's headless-auth token var. Set to the same proxy sentinel
-    # as SONARQUBE_TOKEN so the CLI sends `Bearer proxy-managed` and the proxy
-    # swaps in the real token. (SONARQUBE_TOKEN itself is set to the sentinel by
-    # the engine via the credential above; these are additional aliases so
-    # whichever variable a given Sonar tool reads gets the same sentinel.)
-    SONARQUBE_CLI_TOKEN: "proxy-managed"
-    SONAR_TOKEN: "proxy-managed"
 
 setup:
   install:
     # 1. Install the SonarQube CLI (`sonar`). Native binary -> lands in
-    #    ~/.local/share/sonarqube-cli/bin and is added to PATH by the installer.
-    #    Idempotent: skip if `sonar` is already resolvable.
+    #    ~/.local/share/sonarqube-cli/bin. Idempotent: skip if already present.
     - command: |
-        if command -v sonar >/dev/null 2>&1 || [ -x "$HOME/.local/share/sonarqube-cli/bin/sonar" ]; then
+        if [ -x "$HOME/.local/share/sonarqube-cli/bin/sonar" ]; then
           echo "sonar-vortex: SonarQube CLI already installed"
         else
           curl -fsSL https://raw.githubusercontent.com/SonarSource/sonarqube-cli/refs/heads/master/user-scripts/install.sh | bash \
@@ -131,63 +123,106 @@ setup:
         fi
       user: "1000"
       description: Install the SonarQube CLI (sonar)
-    # 2. Make `sonar` resolvable in non-login shells (the installer appends PATH
-    #    to shell rc files, but exec-style commands don't source them). Drop a
-    #    profile.d-style snippet the agent's shells pick up. Idempotent.
+    # 2. Symlink the binary into ~/.local/bin, which is already on PATH for every
+    #    shell AND for non-login `sbx exec`. (The installer only appends PATH to
+    #    ~/.bashrc, which sh/dash and non-interactive execs don't read.) Also add
+    #    an rc export as a bonus for interactive shells.
     - command: |
-        BIN="$HOME/.local/share/sonarqube-cli/bin"
-        for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
-          [ -f "$rc" ] || continue
-          grep -q 'sonarqube-cli/bin' "$rc" 2>/dev/null && continue
-          printf '\n# sonar-vortex: SonarQube CLI on PATH\nexport PATH="%s:$PATH"\n' "$BIN" >> "$rc"
-        done
-        echo "sonar-vortex: ensured SonarQube CLI is on PATH"
+        SRC="$HOME/.local/share/sonarqube-cli/bin/sonar"
+        if [ -x "$SRC" ]; then
+          mkdir -p "$HOME/.local/bin" && ln -sf "$SRC" "$HOME/.local/bin/sonar"
+          for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
+            [ -e "$rc" ] || : > "$rc"
+            grep -q 'sonarqube-cli/bin' "$rc" 2>/dev/null && continue
+            printf '\n# sonar-vortex: SonarQube CLI on PATH\nexport PATH="%s:$HOME/.local/bin:$PATH"\n' \
+              "$HOME/.local/share/sonarqube-cli/bin" >> "$rc"
+          done
+          echo "sonar-vortex: linked sonar into ~/.local/bin"
+        else
+          echo "sonar-vortex: sonar binary missing; skipping PATH wiring"
+        fi
       user: "1000"
-      description: Ensure the SonarQube CLI is on PATH for the agent's shells
+      description: Put the SonarQube CLI on PATH for all shells
+    # 3. Disable CLI telemetry so the sandbox doesn't attempt (denied) egress to
+    #    events.sonardata.io. Best-effort.
+    - command: |
+        "$HOME/.local/bin/sonar" config telemetry --disabled >/dev/null 2>&1 \
+          && echo "sonar-vortex: CLI telemetry disabled" \
+          || echo "sonar-vortex: could not disable telemetry (non-fatal)"
+      user: "1000"
+      description: Disable SonarQube CLI telemetry
+  startup:
+    # Wire Vortex + the SonarQube MCP Server + secrets hooks into Claude Code via
+    # `sonar integrate claude`. This needs a valid, proxy-injected token; it is
+    # best-effort and never blocks boot. If the token isn't bound/valid yet, the
+    # agent can re-run the command from a shell (see agentInstructions).
+    - command:
+        - "sh"
+        - "-lc"
+        - |
+          export PATH="$HOME/.local/bin:$HOME/.local/share/sonarqube-cli/bin:$PATH"
+          if command -v sonar >/dev/null 2>&1; then
+            if sonar integrate claude --global --non-interactive >/dev/null 2>&1; then
+              echo "sonar-vortex: Vortex + MCP integration ready"
+            else
+              echo "sonar-vortex: run 'sonar integrate claude --non-interactive' once a valid SonarQube token is bound"
+            fi
+          fi
+      user: "1000"
+      background: false
+      description: Wire Sonar Vortex + MCP into Claude Code (sonar integrate claude)
 
 agentInstructions:
   content: |
     # Sonar Vortex
 
-    This sandbox has **Sonar Vortex** wired in: the SonarQube CLI (`sonar`) plus
-    the **SonarQube MCP Server** (started via `.mcp.json` in the workspace). Use
-    it to write higher-quality, more secure code with fewer tokens and less
-    rework — Vortex injects repository-aware context *before* you write, and
-    verifies changes in real time against SonarQube Cloud.
+    This sandbox has the **SonarQube CLI** (`sonar`) installed and, on start,
+    runs `sonar integrate claude` to wire **Sonar Vortex** — the SonarQube MCP
+    Server, secrets-scanning hooks, and repository-aware context. Use it to write
+    higher-quality, more secure code with fewer tokens and less rework.
+
+    ## First, make sure Vortex is wired
+
+    If the `sonarqube` MCP tools or `sonar context` aren't available yet (e.g. the
+    token was bound after boot), run once:
+
+    ```bash
+    sonar integrate claude --non-interactive        # add --project <key> to scope it
+    ```
+
+    Verify with `sonar auth status` (should show **Connected**) and
+    `sonar context` (should list available context, not "not installed").
 
     ## Already configured
 
-    - **Credentials**: `SONARQUBE_TOKEN` is the `proxy-managed` sentinel inside
-      the container, never the real token. Do **not** try to read or print it —
-      the sbx proxy swaps in the real value on the `Authorization: Bearer` header
-      for outbound calls to SonarQube Cloud (`$SONARQUBE_URL`). It never exists in
-      the container.
-    - **Environment**: `SONARQUBE_URL` (region), `SONARQUBE_ORG` (organization)
-      are exported. `SONAR_TOKEN` / `SONARQUBE_CLI_TOKEN` are aliases of the same
-      proxy sentinel.
-    - **MCP server**: the `sonarqube` MCP server is declared in `.mcp.json`. Its
-      tools expose the Vortex capabilities — coding guidelines, third-party
-      dependency health, architecture graphs/constraints, and semantic
-      navigation — plus SonarQube issue/quality-gate queries.
+    - **Credentials**: `SONARQUBE_CLI_TOKEN` is a proxy placeholder inside the
+      container, never the real token. Do **not** read or print it — the sbx proxy
+      swaps in the real value on the `Authorization: Bearer` header for outbound
+      calls to SonarQube Cloud (`$SONARQUBE_CLI_SERVER`). It never exists in the
+      container.
+    - **Environment**: `SONARQUBE_CLI_SERVER` (region), `SONARQUBE_CLI_ORG`
+      (organization), and `SONAR_PROJECT_KEY` (optional) are exported.
+    - **CLI on PATH**: `sonar` is linked into `~/.local/bin`.
     - **Network**: egress is allowed to SonarQube Cloud (`sonarcloud.io` /
       `sonarqube.us` + `api.*`) and the CLI/analyzer download hosts.
 
     ## The Vortex loop
 
-    1. **Before writing code**, pull project context with the `sonarqube` MCP
-       tools (coding guidelines, architecture constraints, dependency health for
-       any package you're about to add or bump). This front-loads the right
-       constraints so you generate compliant code on the first pass.
-    2. **After each change**, verify it with the SonarQube CLI:
+    1. **Before writing code**, pull project context — use the `sonarqube` MCP
+       tools, or `sonar context` — for coding guidelines, third-party dependency
+       health (before adding/bumping a package), architecture constraints, and
+       semantic navigation. This front-loads the right constraints so you generate
+       compliant code on the first pass.
+    2. **After each change**, verify from the terminal:
 
        ```bash
-       sonar analyze agentic            # fast, agent-oriented analysis of the change
-       sonar analyze secrets            # scan the diff/files for hardcoded secrets
-       sonar quality-gate status        # is the project still passing its gate?
-       sonar list issues                # issues Sonar found, to fix before finishing
+       sonar analyze agentic        # server-side Vortex analysis of the change
+       sonar analyze secrets        # scan the diff/files for hardcoded secrets
+       sonar quality-gate status    # is the project still passing its gate?
+       sonar list issues            # issues Sonar found, to fix before finishing
        ```
 
-    3. **Fix what Sonar reports** and re-run until the analysis is clean and the
+    3. **Fix what Sonar reports** and re-run until analysis is clean and the
        quality gate passes. Treat a failing quality gate or a new blocker/critical
        issue as a task that is not yet done.
 

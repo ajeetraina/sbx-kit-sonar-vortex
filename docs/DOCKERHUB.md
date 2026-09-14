@@ -22,26 +22,25 @@ project, add `--kit-arg project=<key>`.
 
 ## What it does
 
-- Installs the **SonarQube CLI** (`sonar`) and puts it on the agent's PATH.
-- Wires the **SonarQube MCP Server** via a workspace `.mcp.json` (`sonar run mcp`),
-  exposing Vortex context tools — coding guidelines, dependency health,
-  architecture constraints, semantic navigation.
-- Declares one proxy-injected credential — `sonarqube` → `SONARQUBE_TOKEN`.
-  Inside the container it reads as the `proxy-managed` sentinel; the proxy swaps
-  in the real token on the `Authorization: Bearer` header for outbound calls to
-  SonarQube Cloud, so the token never enters the container.
-- Sets `SONARQUBE_URL` / `SONARQUBE_ORG` / `SONAR_PROJECT_KEY` and allows egress
-  to `sonarcloud.io` / `sonarqube.us` (+ `api.*`) and the CLI/analyzer download
-  hosts.
+- Installs the **SonarQube CLI** (`sonar`) and links it into `~/.local/bin`.
+- Runs **`sonar integrate claude`** on start to wire the **SonarQube MCP Server**,
+  secrets-scanning hooks, and Vortex context tools — coding guidelines, dependency
+  health, architecture constraints, semantic navigation.
+- Declares one proxy-injected credential — `sonarqube` → `SONARQUBE_CLI_TOKEN`.
+  Inside the container it reads as a proxy placeholder; the proxy swaps in the real
+  token on the `Authorization: Bearer` header for outbound calls to SonarQube
+  Cloud, so the token never enters the container.
+- Sets `SONARQUBE_CLI_SERVER` / `SONARQUBE_CLI_ORG` / `SONAR_PROJECT_KEY`, allows
+  egress to `sonarcloud.io` / `sonarqube.us` (+ `api.*`) and the CLI/analyzer
+  download hosts, and disables CLI telemetry.
 
 ## Store your SonarQube token
 
 SonarQube isn't a built-in sbx service, so store a **USER token** as a custom
-secret bound to the SonarQube Cloud host:
+secret bound to the SonarQube Cloud API host:
 
 ```bash
-sbx secret set-custom --host api.sonarcloud.io --env SONARQUBE_TOKEN --value <user-token>
-sbx secret set-custom --host sonarcloud.io     --env SONARQUBE_TOKEN --value <user-token>
+sbx secret set-custom --host api.sonarcloud.io --env SONARQUBE_CLI_TOKEN --value <user-token>
 ```
 
 Connected mode requires a user token — project/global/scoped-org tokens do not

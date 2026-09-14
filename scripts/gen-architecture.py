@@ -122,8 +122,8 @@ text(112, 262, "generates & edits code in the Vortex loop", f_b, fill=MUTED)
 # MCP server
 MCP_CY = 385
 box(90, 330, 480, 108, BOX_FILL, BOX_EDGE)
-text(112, 348, "SonarQube MCP Server", f_h)
-text(112, 378, "sonar run mcp  (~/.sonar/mcp.sh)", f_b, fill=MUTED)
+text(112, 348, "SonarQube MCP Server + Vortex", f_h)
+text(112, 378, "wired by: sonar integrate claude", f_b, fill=MUTED)
 text(112, 402, "guidelines · deps · architecture · navigation", f_bs, fill=MUTED)
 
 # CLI
@@ -135,7 +135,7 @@ text(112, 542, "quality-gate status · list issues", f_bs, fill=MUTED)
 
 # token sentinel note
 box(90, 610, 480, 44, GREEN_FILL, GREEN, radius=12)
-text(330, 632, "SONARQUBE_TOKEN = proxy-managed  (sentinel, not the real token)",
+text(330, 632, "SONARQUBE_CLI_TOKEN = proxy placeholder  (not the real token)",
      f_tag, fill=GREEN, anchor="mm")
 
 # internal arrows (kept inside the sandbox)
@@ -152,7 +152,7 @@ text(PX_CX, PX["y"] + 50, "credential-injecting", f_bs, fill=MUTED, anchor="ma")
 d.line([(PX["x"] + 22) * S, (PX["y"] + 82) * S, (PX["x"] + PX["w"] - 22) * S, (PX["y"] + 82) * S],
        fill=PROXY_EDGE, width=1 * S)
 bx = PX["x"] + 24
-text(bx, PX["y"] + 98, "• swaps  proxy-managed", f_b)
+text(bx, PX["y"] + 98, "• swaps  placeholder", f_b)
 text(bx + 16, PX["y"] + 120, "→ real token (Bearer)", f_b, fill=MUTED)
 text(bx, PX["y"] + 150, "• enforces egress", f_b)
 text(bx + 16, PX["y"] + 172, "allowlist (deny-all)", f_b, fill=MUTED)
@@ -199,7 +199,7 @@ REQ_Y = MCP_CY                                   # 385, the request lane
 poly([(SBX_R, REQ_Y), (PX["x"], REQ_Y)], color=SBX_EDGE, width=4)
 gap1_cx = (SBX_R + PX["x"]) / 2                  # 665
 text(gap1_cx, REQ_Y - 42, "sends", f_lbl, fill=SBX_EDGE, anchor="ma")
-text(gap1_cx, REQ_Y - 26, "proxy-managed", f_lbl, fill=SBX_EDGE, anchor="ma")
+text(gap1_cx, REQ_Y - 26, "placeholder", f_lbl, fill=SBX_EDGE, anchor="ma")
 
 # proxy -> cloud
 poly([(PX_R, REQ_Y), (CD_L, REQ_Y)], color=PROXY_EDGE, width=4)
