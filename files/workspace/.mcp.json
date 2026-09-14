@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sonarqube": {
+      "command": "sh",
+      "args": ["-c", "exec sh \"$HOME/.sonar/mcp.sh\""]
+    }
+  }
+}
