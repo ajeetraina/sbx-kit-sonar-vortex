@@ -54,16 +54,22 @@ placeholder; the proxy swaps in the real token on the outbound request.
 
 ```bash
 # EU region (sonarcloud.io) — the default
-sbx secret set-custom --host api.sonarcloud.io --env SONARQUBE_CLI_TOKEN --value <user-token>
+sbx secret set-custom --host sonarcloud.io --host '*.sonarcloud.io' \
+  --env SONARQUBE_CLI_TOKEN --value <user-token>
 
 # US region (sonarqube.us) — if you launch with url=https://sonarqube.us
-# sbx secret set-custom --host api.sonarqube.us --env SONARQUBE_CLI_TOKEN --value <user-token>
+# sbx secret set-custom --host sonarqube.us --host '*.sonarqube.us' \
+#   --env SONARQUBE_CLI_TOKEN --value <user-token>
 ```
 
 `SONARQUBE_CLI_TOKEN` is the env var the SonarQube CLI reads for headless auth
 (paired with `SONARQUBE_CLI_SERVER` / `SONARQUBE_CLI_ORG`, which the kit sets from
-the `url` / `org` args). A custom env can only be bound once, so bind it on the
-`api.` host — that's the endpoint the CLI calls.
+the `url` / `org` args). Bind **both** the bare host (`sonarcloud.io`) and the
+wildcard (`*.sonarcloud.io`): the CLI calls the bare host for some endpoints
+(e.g. `sonar list projects`) and `api.`/`scanner.` subdomains for others. `*`
+matches a single label, so it covers `api.` but **not** the bare host — miss the
+bare host and the proxy forwards it un-intercepted (`forward-bypass`), the token
+swap never happens, and live calls fail with `401`.
 
 Add `--sandbox <name>` to scope a secret to one sandbox; pass `--ref 'op://…'`
 instead of `--value` to source from 1Password without putting the token in your
@@ -168,7 +174,8 @@ as a custom secret, then run it:
 
 ```bash
 sbx --app-name sonar-vortex-tck secret set-custom \
-  --host api.sonarcloud.io --env SONARQUBE_CLI_TOKEN --value <user-token>
+  --host sonarcloud.io --host '*.sonarcloud.io' \
+  --env SONARQUBE_CLI_TOKEN --value <user-token>
 ./scripts/test-kit-e2e.sh
 ```
 
