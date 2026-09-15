@@ -37,10 +37,12 @@ project, add `--kit-arg project=<key>`.
 ## Store your SonarQube token
 
 SonarQube isn't a built-in sbx service, so store a **USER token** as a custom
-secret bound to the SonarQube Cloud API host:
+secret bound to the SonarQube Cloud hosts (bind the bare host *and* the wildcard
+— the CLI calls both, and `*` doesn't match the bare host):
 
 ```bash
-sbx secret set-custom --host api.sonarcloud.io --env SONARQUBE_CLI_TOKEN --value <user-token>
+sbx secret set-custom --host sonarcloud.io --host '*.sonarcloud.io' \
+  --env SONARQUBE_CLI_TOKEN --value <user-token>
 ```
 
 Connected mode requires a user token — project/global/scoped-org tokens do not

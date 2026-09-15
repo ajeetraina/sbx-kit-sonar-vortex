@@ -11,7 +11,14 @@
 # the sbx secret store as a CUSTOM secret bound to the SonarQube Cloud host:
 #
 #   sbx --app-name sonar-vortex-tck secret set-custom \
-#       --host api.sonarcloud.io --env SONARQUBE_CLI_TOKEN --value <user-token>
+#       --host sonarcloud.io --host '*.sonarcloud.io' \
+#       --env SONARQUBE_CLI_TOKEN --value <user-token>
+#
+# Bind BOTH the bare host and the wildcard: the CLI calls the bare host for some
+# endpoints (e.g. `sonar list projects`) and api./scanner. subdomains for others.
+# `*` matches a single label, so it covers `api.` but not the bare host — miss the
+# bare host and its egress is forwarded un-intercepted (forward-bypass), the token
+# swap never happens, and live calls 401.
 #
 # (Use --ref 'op://…' instead of --value to source from 1Password.) Everything is
 # scoped to a separate --app-name daemon, so your day-to-day sbx state is left
@@ -36,9 +43,10 @@ APP_NAME="${APP_NAME:-sonar-vortex-tck}"
 POLICY="${POLICY-balanced}"
 KEEP="${KEEP:-0}"
 
-# The credential host the secret must be bound to (bare host of $URL).
+# The credential hosts the secret must be bound to (bare host of $URL + wildcard).
 SQ_HOST="${URL#https://}"; SQ_HOST="${SQ_HOST%%/*}"
 API_HOST="api.${SQ_HOST}"
+WILDCARD_HOST="*.${SQ_HOST}"
 
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SANDBOX="sonar-vortex-e2e-$$"
@@ -80,17 +88,33 @@ if [ -n "${SONARQUBE_CLI_TOKEN:-}" ]; then
 fi
 for _ in 1 2 3 4 5; do "${SBX[@]}" secret ls >/dev/null 2>&1 && break; sleep 1; done
 secrets_out="$("${SBX[@]}" secret ls 2>/dev/null || true)"
-if grep -q "SONARQUBE_CLI_TOKEN" <<<"$secrets_out"; then
-  ok "SONARQUBE_CLI_TOKEN custom secret present"
-else
+sq_line="$(grep "SONARQUBE_CLI_TOKEN" <<<"$secrets_out" || true)"
+if [ -z "$sq_line" ]; then
   bad "SONARQUBE_CLI_TOKEN custom secret missing"
   cat <<EOF
 
-  Store the token first (value never touches this script), then re-run:
-    ${SBX[*]} secret set-custom --host $API_HOST --env SONARQUBE_CLI_TOKEN --value <user-token>
+  Store the token first (value never touches this script), then re-run.
+  Bind BOTH the bare host and the wildcard — the CLI calls both:
+    ${SBX[*]} secret set-custom --host $SQ_HOST --host '$WILDCARD_HOST' \\
+        --env SONARQUBE_CLI_TOKEN --value <user-token>
   (or --ref 'op://<vault>/<item>/<field>' to source from 1Password)
 EOF
   exit 1
+fi
+ok "SONARQUBE_CLI_TOKEN custom secret present"
+# The swap only happens on hosts the secret targets. The CLI calls the BARE host
+# ($SQ_HOST) for endpoints like `sonar list projects`; if the secret is bound only
+# to api.$SQ_HOST, the bare host is forwarded un-intercepted and live calls 401.
+if grep -qE "(^|[[:space:]])${SQ_HOST//./\\.}([[:space:]]|,|\$)" <<<"$sq_line"; then
+  ok "secret targets the bare host '$SQ_HOST' (token swap will fire on it)"
+else
+  bad "secret does NOT target the bare host '$SQ_HOST' — live calls will 401 (forward-bypass)"
+  cat <<EOF
+
+  Re-bind including the bare host and the wildcard:
+    ${SBX[*]} secret set-custom --host $SQ_HOST --host '$WILDCARD_HOST' \\
+        --env SONARQUBE_CLI_TOKEN --value <user-token>
+EOF
 fi
 
 # ---- 3. scoped daemon policy -----------------------------------------------
@@ -112,11 +136,16 @@ fi
 say "4. Launch sandbox '$SANDBOX' with the kit"
 KIT_ARGS=(--kit-arg "url=$URL")
 [ -n "$ORG" ] && KIT_ARGS+=(--kit-arg "org=$ORG")
+# Close stdin (</dev/null) so a missing service binding can't stall on an
+# interactive prompt, and tee output to a log so a failure is diagnosable rather
+# than swallowed. (The kit is best-effort without the binding; the custom secret
+# does the swap, so an unbound 'sonarqube' service only prints a warning.)
+run_log="$WORKDIR/sbx-run.log"
 if "${SBX[@]}" run claude --kit "$KIT_DIR" "${KIT_ARGS[@]}" \
-      --name "$SANDBOX" --detached "$WORKDIR" >/dev/null 2>&1; then
+      --name "$SANDBOX" --detached "$WORKDIR" </dev/null >"$run_log" 2>&1; then
   ok "sandbox created"
 else
-  bad "sbx run failed (re-run without --detached to see any prompt)"; exit 1
+  bad "sbx run failed"; sed 's/^/      /' "$run_log" | tail -25; exit 1
 fi
 ex() { "${SBX[@]}" exec "$SANDBOX" -- "$@"; }
 
@@ -142,10 +171,29 @@ if ex sonar auth status 2>&1 | grep -qi 'Connected'; then
 else
   info "sonar auth status not Connected (SONARQUBE_CLI_ORG/SERVER must both be set)"
 fi
+# A real, authenticated call. The CLI derives its API base from
+# SONARQUBE_CLI_SERVER and calls the BARE host ($SQ_HOST) for this endpoint, so a
+# success here proves the token was actually swapped on the host the CLI uses --
+# not just that plumbing exists. A 401 is a genuine FAILURE (token not swapped),
+# never a pass.
 out=$(ex sonar list projects 2>&1 || true)
 printf '%s\n' "$out" | head -5 | sed 's/^/      /'
 case "$out" in
-  *401*) info "list projects -> 401: plumbing OK (proxy swapped the token); token is invalid/synthetic" ;;
+  *'"projects"'*|*'"paging"'*)
+    ok "sonar list projects returned data — token swap works on $SQ_HOST" ;;
+  *401*)
+    bad "sonar list projects -> 401: token NOT swapped on $SQ_HOST (the host the CLI calls)"
+    cat <<EOF
+      The CLI calls the bare host from SONARQUBE_CLI_SERVER ($URL) — i.e. $SQ_HOST,
+      not just $API_HOST. Bind the token to BOTH hosts:
+        ${SBX[*]} secret set-custom --host $SQ_HOST --host '$WILDCARD_HOST' \\
+            --env SONARQUBE_CLI_TOKEN --value <user-token>
+EOF
+    ;;
+  *'not enabled'*|*Vortex*)
+    info "reached SonarQube Cloud, but Vortex is not enabled for this org (enable it to exercise 'sonar context')" ;;
+  *)
+    bad "sonar list projects returned an unexpected result (see above)" ;;
 esac
 
 # ---- 7. network policy log -------------------------------------------------
