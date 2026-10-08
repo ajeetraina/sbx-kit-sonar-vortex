@@ -1,0 +1,294 @@
+# syntax=docker/sandbox-kit:3
+# Sonar Vortex as a Docker Sandboxes MIXIN (schemaVersion 3).
+#
+# Migrated from the repo-root v2 spec.yaml. As a mixin it carries no ENTRYPOINT —
+# the base workload's launch command stays and you run `claude` (and `sonar`)
+# from the shell; the SonarQube CLI this kit installs and the SONARQUBE_CLI_*
+# environment it wires are just there. The v2 kit shipped a `files/` runbook that
+# `sbx kit push` bundled; v3 ships the same file as a scratch overlay (see
+# sonar-vortex.dockerfile) and the install/startup hooks below install the CLI
+# and run `sonar integrate claude` at create/boot, exactly as v2 did.
+schemaVersion: "3"
+kind: mixin
+displayName: Sonar Vortex
+author: "Ajeet Singh Raina"
+# `version:`/`sourceUrl:`/`licenses:` — `licenses` was in v2; `version`/`sourceUrl`
+# were not. All three name the published artifact
+# (org.opencontainers.image.{version,source,licenses}); a missing one only shows
+# up once the kit is in a registry, so set all three.
+version: "0.1.0"
+sourceUrl: https://github.com/ajeetraina/sbx-kit-sonar-vortex
+licenses:
+  - Apache-2.0
+description: >-
+  Adds Sonar Vortex to a Claude Code sandbox. Installs the SonarQube CLI and runs
+  `sonar integrate claude` to wire the SonarQube MCP Server, secrets-scanning
+  hooks, and Vortex context so the agent gets repository-aware context (coding
+  guidelines, dependency health, architecture, semantic navigation) before it
+  writes code, then verifies every change in real time against your SonarQube
+  Cloud quality profiles and rules with the same algorithmic analysis engine used
+  in production. Your SonarQube token is proxy-injected and never enters the
+  container. Layer it onto a Claude Code base and run `claude` from the shell.
+
+# Sonar Vortex's flagship integration is Claude Code (`sonar integrate claude`),
+# so this kit targets the `claude` base agent — the v2 `requires: {agent: claude}`
+# affinity, carried across as a closed-set requirement on the provide the claude
+# workload publishes. (The SonarQube CLI can also integrate copilot/codex/cursor/
+# gemini, but each writes a different agent config — out of scope for this kit.)
+requires: ["claude"]
+
+# No `provides`. The SonarQube CLI installer fetches the `latest` release (a
+# literal `latest`-style path, no version option and no digest), so the kit
+# cannot honestly assert a matchable `sonar@<version>`. In v3 an unversioned
+# provide is refused at publish (RequireVersionedProvides), and the honest answer
+# when you can't know exactly what resolved is to offer nothing matchable. The v2
+# kit declared no provides either.
+
+# SonarQube Cloud region + organization (+ optional project) are the only
+# per-user inputs; the token is a proxy-injected credential (below), never an arg.
+# In v3, create-phase args (no `buildArg:`) expand across the whole effective
+# descriptor — capability configs included — so `url` still parameterizes the
+# credential region hosts and the network allowlist, and the EU (sonarcloud.io)
+# and US (sonarqube.us) regions both work without editing anything. Each arg's
+# `env:` additionally exports its resolved value into the container under that
+# name, which is how the v2 `environment.variables` SONARQUBE_CLI_SERVER /
+# SONARQUBE_CLI_ORG / SONAR_PROJECT_KEY get set (v3 moves arg-driven env onto the
+# arg's `env:` field).
+#
+# MIGRATION NOTE: v2 also set SONARQUBE_URL / SONARQUBE_ORG — MCP-server aliases
+# of url / org, flagged "harmless when unused" — container-wide. A v3 arg maps to
+# exactly ONE env name, and the load-bearing names are the CLI's
+# (SONARQUBE_CLI_SERVER / SONARQUBE_CLI_ORG), so the MCP aliases are re-derived
+# from them inside the `sonar integrate claude` startup hook, which is where the
+# MCP server config that reads them is written. Behaviour is preserved where it
+# matters; nothing container-wide depends on the bare aliases.
+args:
+  url:
+    default: "https://sonarcloud.io"
+    description: >-
+      SonarQube Cloud base URL. EU: https://sonarcloud.io (default).
+      US: https://sonarqube.us. (SonarQube Server URLs also work but are
+      untested by this kit.)
+    pattern: '^https://[a-z0-9.-]+\.[a-z]{2,}$'
+    env: SONARQUBE_CLI_SERVER
+  org:
+    default: ""
+    description: >-
+      Your SonarQube Cloud organization key (Organization → Administration →
+      Organization key). Required for Vortex; leave empty only to configure it
+      later inside the sandbox.
+    pattern: '^[A-Za-z0-9._-]*$'
+    env: SONARQUBE_CLI_ORG
+  project:
+    default: ""
+    description: >-
+      Optional SonarQube project key. When set, `sonar integrate claude` scopes
+      to this project (it must already have been analyzed on a long-lived branch
+      in SonarQube Cloud). Leave empty to select per-call.
+    pattern: '^[A-Za-z0-9._:-]*$'
+    env: SONAR_PROJECT_KEY
+
+capabilities:
+  # The SonarQube USER token. The SonarQube CLI reads it from SONARQUBE_CLI_TOKEN
+  # for headless auth, alongside SONARQUBE_CLI_SERVER + SONARQUBE_CLI_ORG. It is
+  # proxy-managed: the container only ever sees SONARQUBE_CLI_TOKEN == a proxy
+  # placeholder, and the proxy substitutes the real token into the
+  # `Authorization: Bearer <token>` header on outbound calls to SonarQube Cloud.
+  # The CLI runs natively, trusts the sbx proxy CA, and honors HTTPS_PROXY, so the
+  # swap is transparent.
+  #
+  # phase: runtime — the token is used by `sonar integrate claude` (startup hook)
+  # and by the agent's Vortex loop in steady state, not by the install hooks. v2
+  # marked it `required: true`; v3 entries are required by default, so we simply
+  # omit `optional` to keep that (the sandbox fails to create without a bound
+  # SonarQube secret — store it first; see the README).
+  #
+  # The token injects on BOTH the EU and US API hosts; whichever region the CLI
+  # actually calls gets the swap, the other rule is unused. Injection is keyed by
+  # (domain, header), so nothing is crossed.
+  #
+  # MIGRATION NOTE: v2 wrote `scheme: bearer`. v3 has no bearer scheme — a bearer
+  # credential is expressed as the Authorization header with a "Bearer %s" format
+  # (the same shape the gh/codex examples use). Every inject domain MUST appear in
+  # the SAME phase's (runtime) network allow list below, as an EXACT host match,
+  # so each bare host is listed there literally.
+  #
+  # NOTE: connected mode requires a USER token — project, global, or scoped
+  # organization tokens will not bind correctly.
+  - type: com.docker.sandbox/credential@1
+    description: "SonarQube Cloud USER token (sent as Authorization: Bearer)."
+    config:
+      service: sonarqube
+      phase: runtime
+      apiKey:
+        name: SONARQUBE_CLI_TOKEN
+        proxyManaged: true
+        inject:
+          - {domain: "sonarcloud.io", header: Authorization, format: "Bearer %s"}
+          - {domain: "api.sonarcloud.io", header: Authorization, format: "Bearer %s"}
+          - {domain: "sonarqube.us", header: Authorization, format: "Bearer %s"}
+          - {domain: "api.sonarqube.us", header: Authorization, format: "Bearer %s"}
+
+  # v2 had one flat egress list; v3 is phase-scoped. An absent phase grants
+  # nothing, and the union of install+runtime must lose no host from the v2 list.
+  #   install  — only the CLI installer reaches the network (curl | bash pulling
+  #              the install script and the `sonar` release binary).
+  #   runtime  — `sonar integrate claude` and the agent's `sonar analyze` loop
+  #              reach SonarQube Cloud, and `sonar analyze` downloads the analysis
+  #              engine from binaries.sonarsource.com.
+  #
+  # MIGRATION NOTE: the GitHub installer hosts (raw./objects.githubusercontent.com,
+  # github.com) are now install-ONLY. v2's single flat list allowed them at
+  # runtime too, but the CLI is installed once at create and the agent re-runs
+  # only `sonar integrate claude` (SonarQube Cloud), never the installer, so
+  # runtime no longer needs them. binaries.sonarsource.com is listed in BOTH: the
+  # installer may prefetch the analyzer and `sonar analyze` downloads it at
+  # runtime. The SonarQube Cloud inject domains are listed literally (exact-match
+  # inject cross-check); the `*.` wildcards widen nothing they did not already
+  # cover at run time but do NOT satisfy the inject check on their own.
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      install:
+        allow:
+          # SonarQube CLI installer + the `sonar` release binary it downloads.
+          - "raw.githubusercontent.com"
+          - "github.com"
+          - "objects.githubusercontent.com"
+          # Analyzer artifacts (also needed at runtime; see below).
+          - "binaries.sonarsource.com"
+      runtime:
+        allow:
+          # SonarQube Cloud EU (sonarcloud.io) + US (sonarqube.us) web + API hosts.
+          # Bare host + api. subdomain are credential inject domains (listed
+          # literally for the exact-match cross-check); *. covers scanner./other
+          # one-label siblings.
+          - "sonarcloud.io"
+          - "api.sonarcloud.io"
+          - "*.sonarcloud.io"
+          - "sonarqube.us"
+          - "api.sonarqube.us"
+          - "*.sonarqube.us"
+          # `sonar analyze` downloads the analysis engine here at runtime.
+          - "binaries.sonarsource.com"
+
+  # Hook environments are DENY-BY-DEFAULT in v3: a hook sees only the platform
+  # baseline (PATH, HOME, HOSTNAME, TERM, PWD, OLDPWD, SHLVL, _) plus the names it
+  # declares in `env:`. v2's hook environment was unrestricted, so curl/the CLI
+  # saw the sandbox's forced-proxy and CA variables silently; here they are
+  # declared explicitly so the install still reaches the allowlisted hosts and the
+  # token swap works on `sonar integrate`.
+  #
+  # MIGRATION NOTE: the hooks keep v2's explicit `user: "1000"` (the agent user).
+  # v3 install hooks default to ROOT, but these install into the agent's own home
+  # (~/.local/share/sonarqube-cli, ~/.local/bin) and must run as uid 1000, so the
+  # explicit user is load-bearing now, not just carried-over.
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        # 1. Install the SonarQube CLI (`sonar`). Native binary -> lands in
+        #    ~/.local/share/sonarqube-cli/bin. Idempotent: skip if already present.
+        - command: |
+            if [ -x "$HOME/.local/share/sonarqube-cli/bin/sonar" ]; then
+              echo "sonar-vortex: SonarQube CLI already installed"
+            else
+              curl -fsSL https://raw.githubusercontent.com/SonarSource/sonarqube-cli/refs/heads/master/user-scripts/install.sh | bash \
+                || echo "sonar-vortex: SonarQube CLI install failed (check network allowlist / region)"
+            fi
+          user: "1000"
+          # curl (and the install.sh it pipes to bash) fetch through the sandbox's
+          # forced proxy and must trust its MITM CA; none of these are in the
+          # baseline, so declare them.
+          env:
+            - HTTP_PROXY
+            - HTTPS_PROXY
+            - NO_PROXY
+            - http_proxy
+            - https_proxy
+            - no_proxy
+            - SSL_CERT_FILE
+            - SSL_CERT_DIR
+            - CURL_CA_BUNDLE
+          description: Install the SonarQube CLI (sonar)
+        # 2. Symlink the binary into ~/.local/bin, which is already on PATH for
+        #    every shell AND for non-login `sbx exec`. (The installer only appends
+        #    PATH to ~/.bashrc, which sh/dash and non-interactive execs don't read.)
+        #    Also add an rc export as a bonus for interactive shells. This merges
+        #    into ~/.bashrc/.profile/.zshrc that the composed base writes, so it
+        #    stays a create-time hook (a layer replaces a file, it cannot append).
+        - command: |
+            SRC="$HOME/.local/share/sonarqube-cli/bin/sonar"
+            if [ -x "$SRC" ]; then
+              mkdir -p "$HOME/.local/bin" && ln -sf "$SRC" "$HOME/.local/bin/sonar"
+              for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
+                [ -e "$rc" ] || : > "$rc"
+                grep -q 'sonarqube-cli/bin' "$rc" 2>/dev/null && continue
+                printf '\n# sonar-vortex: SonarQube CLI on PATH\nexport PATH="%s:$HOME/.local/bin:$PATH"\n' \
+                  "$HOME/.local/share/sonarqube-cli/bin" >> "$rc"
+              done
+              echo "sonar-vortex: linked sonar into ~/.local/bin"
+            else
+              echo "sonar-vortex: sonar binary missing; skipping PATH wiring"
+            fi
+          user: "1000"
+          description: Put the SonarQube CLI on PATH for all shells
+        # 3. Disable CLI telemetry so the sandbox doesn't attempt (denied) egress
+        #    to events.sonardata.io. Best-effort, local config write — no network.
+        - command: |
+            "$HOME/.local/bin/sonar" config telemetry --disabled >/dev/null 2>&1 \
+              && echo "sonar-vortex: CLI telemetry disabled" \
+              || echo "sonar-vortex: could not disable telemetry (non-fatal)"
+          user: "1000"
+          description: Disable SonarQube CLI telemetry
+      startup:
+        # Wire Vortex + the SonarQube MCP Server + secrets hooks into Claude Code
+        # via `sonar integrate claude`. This needs a valid, proxy-injected token;
+        # it is best-effort and never blocks boot. If the token isn't bound/valid
+        # yet, the agent can re-run the command from a shell (see the context
+        # file). Runs every boot and is idempotent, as startup hooks must be.
+        #
+        # SONARQUBE_URL / SONARQUBE_ORG are the MCP-server aliases v2 set
+        # container-wide; re-derived here from the CLI vars so `sonar integrate`
+        # bakes them into the MCP server config (see the args MIGRATION NOTE).
+        - command:
+            - "sh"
+            - "-lc"
+            - |
+              export PATH="$HOME/.local/bin:$HOME/.local/share/sonarqube-cli/bin:$PATH"
+              export SONARQUBE_URL="${SONARQUBE_URL:-$SONARQUBE_CLI_SERVER}"
+              export SONARQUBE_ORG="${SONARQUBE_ORG:-$SONARQUBE_CLI_ORG}"
+              if command -v sonar >/dev/null 2>&1; then
+                if sonar integrate claude --global --non-interactive >/dev/null 2>&1; then
+                  echo "sonar-vortex: Vortex + MCP integration ready"
+                else
+                  echo "sonar-vortex: run 'sonar integrate claude --non-interactive' once a valid SonarQube token is bound"
+                fi
+              fi
+          user: "1000"
+          background: false
+          # `sonar integrate` validates the token against SonarQube Cloud: it
+          # reads the runtime credential placeholder (SONARQUBE_CLI_TOKEN), the
+          # region/org/project, and makes an HTTPS call through the forced proxy
+          # (which swaps the real token in). All deny-by-default.
+          env:
+            - SONARQUBE_CLI_TOKEN
+            - SONARQUBE_CLI_SERVER
+            - SONARQUBE_CLI_ORG
+            - SONAR_PROJECT_KEY
+            - HTTP_PROXY
+            - HTTPS_PROXY
+            - NO_PROXY
+            - http_proxy
+            - https_proxy
+            - no_proxy
+            - SSL_CERT_FILE
+            - SSL_CERT_DIR
+            - CURL_CA_BUNDLE
+          description: Wire Sonar Vortex + MCP into Claude Code (sonar integrate claude)
+
+  # v2 agentInstructions.content -> staged context file. A mixin contributes
+  # context but owns no profile, so `contentFile` only (no `filename:`, which is
+  # workload-only). The body uses shell-style $SONARQUBE_CLI_SERVER, not
+  # ${{ kit.args.* }}, so staging it byte-for-byte is correct.
+  - type: com.docker.sandbox/agent-context@1
+    config:
+      contentFile: ./sonar-vortex-context.md

@@ -182,6 +182,30 @@ sbx --app-name sonar-vortex-tck secret set-custom \
 Useful overrides: `URL=https://sonarqube.us`, `ORG=<org>`, `KEEP=1` (keep the
 sandbox to poke at it), `POLICY=` (skip the policy step).
 
+## Kit v3 (schemaVersion 3)
+
+A v3 descriptor of this mixin lives under [`v3/sonar-vortex/`](v3/sonar-vortex/)
+alongside the v2 `spec.yaml` (both stay published — a v3 mixin only composes onto
+v3 workloads, a v2 mixin only onto v2 agents). The v3 kit publishes under its own
+image name, **`sonar-vortex-kit-v3`**, fully distinct from the v2
+`sonar-vortex-kit`, so the two never collide. A v3 kit is an ordinary OCI image
+built with `docker buildx`; the kit frontend validates the descriptor during the
+build. Build, conformance-check, and publish it with:
+
+```bash
+# build-only (validates the descriptor + builds the overlay into an OCI layout)
+PUSH=0 bash ./scripts/push-kit-v3.sh
+kit-tck validate --layout /tmp/sbx-kit-sonar-vortex-kit-v3-layout latest-0.1.0
+
+# publish (CI does this on push to main + manual dispatch; see
+# .github/workflows/publish-kit-v3.yml)
+bash ./scripts/push-kit-v3.sh            # pushes :latest and :latest-0.1.0
+
+# run it (composes onto a v3 claude workload)
+sbx run claude --kit docker.io/ajeetraina777/sonar-vortex-kit-v3:latest \
+  --kit-arg org=<your-org> .
+```
+
 ## Architecture
 
 `docs/architecture.png` is generated (no mermaid) by `scripts/gen-architecture.py`
